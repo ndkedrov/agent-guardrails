@@ -26,7 +26,8 @@ START_MATCHER = 'startup|resume|clear|compact'
 
 
 def hook_entries(skill_dir, agent, enable):
-    python = sys.executable or 'python3'
+    # A PATH launcher survives tool upgrades; sys.executable may resolve into a versioned app bundle.
+    python = shutil.which('python3') or sys.executable or 'python3'
     extra = ' --enable %s' % ','.join(enable) if enable else ''
     start = {'type': 'command', 'command': '"%s" "%s"' % (python, os.path.join(skill_dir, 'hooks', 'session_start.py')), 'timeout': 10}
     guard = {'type': 'command', 'command': '"%s" "%s"%s' % (python, os.path.join(skill_dir, 'hooks', 'guard.py'), extra), 'timeout': 10}
