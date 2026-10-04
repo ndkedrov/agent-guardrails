@@ -38,7 +38,7 @@ skills/agent-guardrails/
   DIGEST.md           a 2.4 KB digest injected at every session start, resume and compaction
   references/01..13   per category: subtypes, root causes, costs, prevention measures, checklists
   hooks/session_start.py   SessionStart hook: injects DIGEST.md
-  hooks/guard.py           PreToolUse hook: blocks dangerous shell commands (see below)
+  hooks/guard.py           PreToolUse hook: blocks secret leaks and destructive commands (see below)
 install.py            installs or updates or removes everything for Claude Code and/or Codex
 tests/                unit tests for the guard and the installer
 ```
@@ -61,7 +61,7 @@ By default the installer configures every agent it finds (`~/.claude`, `~/.codex
 - registers the SessionStart and PreToolUse hooks in `~/.claude/settings.json` and `~/.codex/hooks.json`;
 - backs up each settings file before changing it, and never touches hooks that are not its own.
 
-Options: `--claude`, `--codex`, `--no-hooks` (skill only), `--dry-run`, `--uninstall`. To update, run `git pull && python3 install.py`.
+Options: `--claude`, `--codex`, `--no-hooks` (skill only), `--enable git_stage_all,read_budget`, `--dry-run`, `--uninstall`. To update, run `git pull && python3 install.py`.
 
 **Codex:** Codex runs new or changed hooks only after you review and trust them. Open Codex after installing and approve the two `agent-guardrails` hooks.
 
@@ -73,27 +73,50 @@ If you prefer not to install hooks, use `--no-hooks` and paste the contents of `
 
 ### What the guard blocks
 
-`hooks/guard.py` inspects shell commands (`Bash` in Claude Code, `exec_command` in Codex) and Claude Code's `Read` tool.
+`hooks/guard.py` inspects shell commands (`Bash`; Codex reports its shell commands under the same name) and Claude Code's `Read` tool. It is deliberately narrow: it targets what destroys data or leaks secrets, not style.
 
-| Level | Blocks | Why |
-|-------|--------|-----|
-| hard | Reading `.env*` (not `.env.example`), private keys, `*.pem/*.key/*.p8/*.p12`, credential files, `/proc/*/environ`; bare `env`/`printenv`; `docker inspect` without `--format`; `docker compose config` | secrets end up in the transcript |
-| hard | Over `ssh` or `kubectl exec`: test suites, `migrate:fresh/refresh/reset`, `db:wipe`, `db:seed`, `DROP`, `TRUNCATE`, `FLUSHALL` | tests and fresh migrations wipe real data |
-| soft | `git push --force`, `reset --hard`, `checkout .`, `restore .`, `clean -f`, `branch -D`, `stash drop/clear` | discards work, possibly someone else's |
-| soft | `git add -A/./--all/-u`, `git commit -a` | commits other people's changes |
-| soft | `cat` of files larger than 40 KB in total, or of 4+ files, without a limiting pipe | output gets truncated and is silently unread |
-| soft (Codex only) | Non-ASCII Python source through `python3 -` / `-c` | non-UTF-8 agent shells fail with `SyntaxError` |
+**On by default**
 
-Safe forms stay allowed. For example, `grep -c KEY .env`, `sed -n 's/=.*//p' .env` (key names only), `docker inspect -f '{{.State.Status}}' app`, and running tests locally with `docker exec app php artisan test`.
+| Rule | Blocks | Level |
+|------|--------|-------|
+| `secrets` | Printing secret values: `cat .env`, `grep TOKEN .env`, `grep -n . .env`, private keys, `*.pem/*.key/*.p8/*.p12`, credential files, `/proc/*/environ`, bare `env`/`printenv`, `docker inspect` without `--format`, `docker compose config` | guarded |
+| `remote_db` | Over `ssh` / `kubectl exec`: test suites, `migrate:fresh/refresh/reset`, `db:wipe`, `db:seed` without `--class`, `DROP`, SQL `TRUNCATE`, `FLUSHALL` | hard |
+| `git_destructive` | `git push --force`, `reset --hard`, `checkout .`, `restore .`, `clean -f` | soft |
 
-- **Soft blocks** can be overridden deliberately by appending `# guardrails:allow <reason>` to the command. The agent is told to mention the reason to you.
-- **Hard blocks** cannot be overridden by the agent.
-- **Switches:**
-  - `AGENT_GUARDRAILS=off` in the agent's environment disables everything.
-  - A file named `.agent-guardrails-off` in a project (or any parent directory) disables it for that tree.
-  - `AGENT_GUARDRAILS_SKIP=secrets,remote,git,read_budget,python_stdin` skips individual checks.
-  - `AGENT_GUARDRAILS_READ_LIMIT=<bytes>` changes the read budget.
-- **Fail-open:** if the guard itself fails, the command goes through. A broken guard should never block your session.
+**Opt-in** (`python3 install.py --enable git_stage_all,read_budget`)
+
+| Rule | Blocks | Level |
+|------|--------|-------|
+| `git_stage_all` | `git add -A/./--all/-u`, `git commit -a`. Useful when several agents share one working tree | soft |
+| `read_budget` | `cat` of more than 40 KB without a limiting pipe | soft |
+
+**Not blocked**, because it is routine:
+- `git add -A`, `git commit -a`, `git branch -D`, `git stash drop`, `git restore --staged .`, `--force-with-lease`;
+- `cp .env.example .env`, `sed -i … .env`, `grep APP_URL .env` (named non-secret keys), `grep -c` / `-l` / `--files`, key-name listings (`sed -n 's/=.*//p' .env`);
+- tests run locally (`docker exec app php artisan test`), and `ssh … migrate --force` / `db:seed --class=…`.
+
+**Levels**
+- **soft**: the agent may re-run the command with `# guardrails:allow <reason>` when the action is really intended.
+- **guarded**: the block is lifted only by `# guardrails:allow user asked: "<the user's words>"`.
+- **hard**: only the user can run it.
+
+**The user's explicit request wins.** The skill tells agents that the rules limit their *own initiative*. If you explicitly ask for something a rule discourages ("show me the whole .env", "force-push it"), the agent does it. If the guard blocks the command, the agent re-runs it with `# guardrails:allow user asked: "<your words>"` without asking you again. Agents are told never to add this marker on their own. The only thing an agent cannot unlock is a hard block: it shows you the command and you run it yourself.
+
+**How much it gets in the way.** Replaying three weeks of real sessions on the author's machine through the default rules:
+
+| Agent | Shell commands | Would be blocked | Mostly |
+|-------|---------------:|-----------------:|--------|
+| Claude Code | 94,110 | 194 (0.21%) | rule hits: 165 secret prints (`grep KEY/TOKEN/PASSWORD .env`, `cat .env`), 32 destructive git, 6 remote DB (a few commands trip two rules) |
+| Codex | 36,686 | 8 (0.02%) | secret prints |
+
+The two opt-in rules were measured the same way. `git_stage_all` would block 1 in 144 Claude commands, and `read_budget` 1 in 43 Codex commands, mostly legitimate skill reading. That is too disruptive to enable by default.
+
+**Switches**
+- `AGENT_GUARDRAILS=off` in the agent's environment disables everything.
+- A file named `.agent-guardrails-off` in a project (or any parent directory) disables it for that tree.
+- `AGENT_GUARDRAILS_SKIP=secrets,remote_db,git_destructive` skips individual rules. `AGENT_GUARDRAILS_ENABLE=git_stage_all,read_budget` turns on the opt-in ones.
+- `AGENT_GUARDRAILS_READ_LIMIT=<bytes>` changes the read budget.
+- **Fail-open:** if the guard itself fails, the command goes through.
 
 ### Limitations
 
@@ -145,7 +168,7 @@ skills/agent-guardrails/
   DIGEST.md           дайджест на 2,4 КБ, що додається на старті, відновленні й ущільненні кожної сесії
   references/01..13   по кожній категорії: підтипи, корені, наслідки, заходи запобігання, чеклисти
   hooks/session_start.py   хук SessionStart: додає DIGEST.md у контекст
-  hooks/guard.py           хук PreToolUse: блокує небезпечні shell-команди (див. нижче)
+  hooks/guard.py           хук PreToolUse: блокує витоки секретів і руйнівні команди (див. нижче)
 install.py            встановлює, оновлює чи видаляє все для Claude Code та/або Codex
 tests/                юніт-тести сторожа та інсталятора
 ```
@@ -168,7 +191,7 @@ python3 install.py
 - реєструє хуки SessionStart і PreToolUse у `~/.claude/settings.json` та `~/.codex/hooks.json`;
 - перед зміною робить резервну копію кожного файлу налаштувань і ніколи не чіпає чужі хуки.
 
-Опції: `--claude`, `--codex`, `--no-hooks` (лише скіл), `--dry-run`, `--uninstall`. Оновлення: `git pull && python3 install.py`.
+Опції: `--claude`, `--codex`, `--no-hooks` (лише скіл), `--enable git_stage_all,read_budget`, `--dry-run`, `--uninstall`. Оновлення: `git pull && python3 install.py`.
 
 **Codex:** нові чи змінені хуки Codex запускає лише після того, як ви їх переглянете й довірите. Після встановлення відкрийте Codex і підтвердьте два хуки `agent-guardrails`.
 
@@ -180,27 +203,50 @@ python3 install.py
 
 ### Що блокує сторож
 
-`hooks/guard.py` перевіряє shell-команди (`Bash` у Claude Code, `exec_command` у Codex) та інструмент `Read` у Claude Code.
+`hooks/guard.py` перевіряє shell-команди (`Bash`; Codex передає свої shell-команди під тією самою назвою) та інструмент `Read` у Claude Code. Він навмисно вузький: ловить те, що знищує дані чи виносить секрети, а не стиль.
 
-| Рівень | Що блокує | Чому |
-|--------|-----------|------|
-| жорсткий | Читання `.env*` (крім `.env.example`), приватних ключів, `*.pem/*.key/*.p8/*.p12`, файлів облікових даних, `/proc/*/environ`; голий `env`/`printenv`; `docker inspect` без `--format`; `docker compose config` | секрети потрапляють у транскрипт |
-| жорсткий | Через `ssh` чи `kubectl exec`: тестові набори, `migrate:fresh/refresh/reset`, `db:wipe`, `db:seed`, `DROP`, `TRUNCATE`, `FLUSHALL` | тести й «свіжі» міграції стирають реальні дані |
-| м'який | `git push --force`, `reset --hard`, `checkout .`, `restore .`, `clean -f`, `branch -D`, `stash drop/clear` | знищує роботу, можливо чужу |
-| м'який | `git add -A/./--all/-u`, `git commit -a` | комітить чужі зміни |
-| м'який | `cat` файлів загальним обсягом понад 40 КБ або 4+ файлів без обмежувального пайпа | вивід обрізається, і частина мовчки лишається непрочитаною |
-| м'який (лише Codex) | Python-код не-ASCII через `python3 -` / `-c` | в оболонках агентів не в UTF-8 це падає з `SyntaxError` |
+**Увімкнено за замовчуванням**
 
-Безпечні форми дозволені. Наприклад: `grep -c KEY .env`, `sed -n 's/=.*//p' .env` (лише назви ключів), `docker inspect -f '{{.State.Status}}' app` і локальний запуск тестів через `docker exec app php artisan test`.
+| Правило | Що блокує | Рівень |
+|---------|-----------|--------|
+| `secrets` | Вивід значень секретів: `cat .env`, `grep TOKEN .env`, `grep -n . .env`, приватні ключі, `*.pem/*.key/*.p8/*.p12`, файли облікових даних, `/proc/*/environ`, голий `env`/`printenv`, `docker inspect` без `--format`, `docker compose config` | захищений |
+| `remote_db` | Через `ssh` / `kubectl exec`: тестові набори, `migrate:fresh/refresh/reset`, `db:wipe`, `db:seed` без `--class`, `DROP`, SQL `TRUNCATE`, `FLUSHALL` | жорсткий |
+| `git_destructive` | `git push --force`, `reset --hard`, `checkout .`, `restore .`, `clean -f` | м'який |
 
-- **М'які блоки** можна свідомо обійти, дописавши до команди `# guardrails:allow <причина>`. Агенту сказано повідомити вам цю причину.
-- **Жорсткі блоки** агент обійти не може.
-- **Перемикачі:**
-  - `AGENT_GUARDRAILS=off` у середовищі агента вимикає все.
-  - Файл `.agent-guardrails-off` у проєкті (або в будь-якій батьківській теці) вимикає сторожа для цього дерева.
-  - `AGENT_GUARDRAILS_SKIP=secrets,remote,git,read_budget,python_stdin` пропускає окремі перевірки.
-  - `AGENT_GUARDRAILS_READ_LIMIT=<байти>` змінює бюджет читання.
-- **Відмова на пропуск:** якщо сам сторож зламався, команда проходить. Зламаний сторож не має блокувати вашу сесію.
+**Вмикаються окремо** (`python3 install.py --enable git_stage_all,read_budget`)
+
+| Правило | Що блокує | Рівень |
+|---------|-----------|--------|
+| `git_stage_all` | `git add -A/./--all/-u`, `git commit -a`. Корисно, коли кілька агентів працюють в одному робочому дереві | м'який |
+| `read_budget` | `cat` понад 40 КБ без обмежувального пайпа | м'який |
+
+**Не блокується**, бо це рутина:
+- `git add -A`, `git commit -a`, `git branch -D`, `git stash drop`, `git restore --staged .`, `--force-with-lease`;
+- `cp .env.example .env`, `sed -i … .env`, `grep APP_URL .env` (названі несекретні ключі), `grep -c` / `-l` / `--files`, перелік назв ключів (`sed -n 's/=.*//p' .env`);
+- локальні тести (`docker exec app php artisan test`), а також `ssh … migrate --force` / `db:seed --class=…`.
+
+**Рівні**
+- **м'який**: агент може повторити команду з `# guardrails:allow <причина>`, якщо дія справді задумана.
+- **захищений**: блок знімає лише `# guardrails:allow user asked: "<слова користувача>"`.
+- **жорсткий**: виконати команду може тільки сам користувач.
+
+**Явне прохання користувача важливіше за правила.** Скіл прямо каже агентам, що правила обмежують їхню *власну ініціативу*. Якщо ви явно просите те, від чого правило застерігає («покажи весь .env», «зроби force-push»), агент це робить. Якщо сторож блокує команду, агент повторює її з `# guardrails:allow user asked: "<ваші слова>"`, не перепитуючи вас. Ставити цю позначку з власної ініціативи агентам заборонено. Обійти агент не може лише жорсткий блок: тоді він показує вам команду, і ви запускаєте її самі.
+
+**Наскільки це заважає.** Три тижні реальних сесій на машині автора, програні через правила за замовчуванням:
+
+| Агент | Shell-команд | Було б заблоковано | Здебільшого |
+|-------|-------------:|-------------------:|-------------|
+| Claude Code | 94 110 | 194 (0,21%) | спрацювання: 165 виводів секретів (`grep KEY/TOKEN/PASSWORD .env`, `cat .env`), 32 руйнівні git-команди, 6 віддалених БД (кілька команд зачепили два правила) |
+| Codex | 36 686 | 8 (0,02%) | виводи секретів |
+
+Два правила, що вмикаються окремо, заміряно так само. `git_stage_all` блокував би кожну 144-ту команду Claude, а `read_budget` — кожну 43-тю команду Codex, переважно законне читання скілів. Для увімкнення за замовчуванням це надто заважає.
+
+**Перемикачі**
+- `AGENT_GUARDRAILS=off` у середовищі агента вимикає все.
+- Файл `.agent-guardrails-off` у проєкті (або в будь-якій батьківській теці) вимикає сторожа для цього дерева.
+- `AGENT_GUARDRAILS_SKIP=secrets,remote_db,git_destructive` вимикає окремі правила. `AGENT_GUARDRAILS_ENABLE=git_stage_all,read_budget` вмикає додаткові.
+- `AGENT_GUARDRAILS_READ_LIMIT=<байти>` змінює бюджет читання.
+- **Відмова на пропуск:** якщо сам сторож зламався, команда проходить.
 
 ### Обмеження
 

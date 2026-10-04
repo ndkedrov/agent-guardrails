@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PreToolUse guard for Claude Code (Bash, Read) and Codex (exec_command).
+"""PreToolUse guard for Claude Code and Codex (shell commands arrive as Bash; Claude Code Read is checked too).
 
 Blocks the shell patterns behind the most damaging recorded agent mistakes. Soft blocks can be
 overridden by appending "# guardrails:allow <reason>" to the command; hard blocks need the user.
@@ -15,14 +15,17 @@ OVERRIDE = re.compile(r'#\s*guardrails:allow\s+\S.{2,}')
 READ_LIMIT = int(os.environ.get('AGENT_GUARDRAILS_READ_LIMIT', '40000'))
 SEPARATORS = {';', '&&', '||', '|', '&', '|&', '(', ')'}
 READERS = {'cat', 'less', 'more', 'head', 'tail', 'bat', 'sed', 'awk', 'gawk', 'grep', 'egrep', 'fgrep', 'rg', 'strings',
-           'xxd', 'od', 'hexdump', 'base64', 'nl', 'cut', 'sort', 'uniq', 'jq', 'yq', 'tac', 'column', 'diff', 'cp', 'scp', 'open'}
-QUIET_SEARCH_FLAGS = {'-c', '--count', '-l', '--files-with-matches', '-L', '--files-without-match', '-q', '--quiet', '--count-matches'}
+           'xxd', 'od', 'hexdump', 'base64', 'nl', 'cut', 'sort', 'uniq', 'jq', 'yq', 'tac', 'column', 'diff'}
+QUIET_SEARCH_FLAGS = {'-c', '--count', '-l', '--files-with-matches', '-L', '--files-without-match', '-q', '--quiet', '--count-matches', '--files'}
+SEARCHERS = {'grep', 'egrep', 'fgrep', 'rg'}
+VALUE_OPTIONS = {'-e', '-f', '-m', '-A', '-B', '-C', '-g', '-t', '-T', '-M', '--glob', '--type', '--max-count', '--regexp'}
+SECRETISH = re.compile(r'pass|secret|token|key|priv|cred|auth|dsn|salt|cert|sign|bearer|cookie|session|smtp|aws|api', re.I)
 ENV_TEMPLATES = {'example', 'sample', 'dist', 'template', 'defaults', 'schema'}
 SECRET_NAMES = {'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519', '.netrc', '.git-credentials', '.npmrc', '.pypirc',
                 'credentials', 'credentials.json', 'auth.json', 'secrets.json', 'service-account.json'}
 SECRET_SUFFIXES = ('.pem', '.key', '.p8', '.p12', '.pfx', '.keystore', '.jks', '.credentials.env')
-REMOTE_DANGER = re.compile(r'migrate:(?:fresh|refresh|reset)|db:wipe|db:seed|artisan\s+test|\bphpunit\b|\bpest\b|'
-                           r'rails\s+db:(?:drop|reset|schema:load)|\bdrop\s+(?:database|table|schema)\b|\btruncate\b|'
+REMOTE_DANGER = re.compile(r'migrate:(?:fresh|refresh|reset)|db:wipe|db:seed(?![^;&|]*--class)|artisan\s+test|\bphpunit\b|\bpest\b|'
+                           r'rails\s+db:(?:drop|reset|schema:load)|\bdrop\s+(?:database|table|schema)\b|\btruncate\s+(?!-)(?:table\s+)?[`"\w]|'
                            r'\bflushall\b|\bflushdb\b|\brm\s+-[a-z]*r[a-z]*f?[a-z]*\s+/(?:\s|$)', re.I)
 WRAPPERS = {'sudo', 'command', 'exec', 'time', 'nohup', 'nice', 'stdbuf', 'timeout', 'xargs'}
 HEREDOC = re.compile(r'<<-?\s*([\'"]?)([A-Za-z_][A-Za-z0-9_]*)\1')
@@ -116,6 +119,28 @@ def key_names_only(name, args):
     return False
 
 
+def narrow_search(args):
+    """True when a search over a secret file targets named, non-secret keys (e.g. APP_URL), so values stay out."""
+    pattern, i = None, 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ('-e', '--regexp'):
+            pattern = args[i + 1] if i + 1 < len(args) else ''
+            break
+        if arg in VALUE_OPTIONS:
+            i += 2
+            continue
+        if not arg.startswith('-'):
+            pattern = arg
+            break
+        i += 1
+    if pattern is None or '-v' in args or '--invert-match' in args:
+        return False
+    core = pattern.strip('^$')
+    broad = len(core) <= 2 or '.*' in pattern or core in ('.', '=', '[A-Z]', '\\w')
+    return not broad and not SECRETISH.search(pattern)
+
+
 def check_secrets(pipelines, raw):
     for pipeline in pipelines:
         for argv in pipeline:
@@ -131,7 +156,9 @@ def check_secrets(pipelines, raw):
             if name == 'docker-compose' and args[:1] == ['config'] and not set(args) & {'--services', '--volumes', '-q', '--quiet', '--hash'}:
                 return '`docker-compose config` prints the resolved configuration including secret environment values'
             if name in READERS:
-                if name in ('grep', 'egrep', 'fgrep', 'rg') and set(args) & QUIET_SEARCH_FLAGS:
+                if name in SEARCHERS and (set(args) & QUIET_SEARCH_FLAGS or narrow_search(args)):
+                    continue
+                if name == 'sed' and any(a == '-i' or a.startswith('-i') or a == '--in-place' for a in args):
                     continue
                 if key_names_only(name, args):
                     continue
@@ -155,6 +182,8 @@ def check_remote(pipelines):
 
 
 def check_git(pipelines):
+    """Return [(rule, reason)]: rule is git_destructive or git_stage_all."""
+    found = []
     for pipeline in pipelines:
         for argv in pipeline:
             name, args = program(argv)
@@ -166,25 +195,22 @@ def check_git(pipelines):
                 continue
             sub, rest = args[0], args[1:]
             shorts = ''.join(a[1:] for a in rest if re.fullmatch(r'-[A-Za-z]+', a))
+            everything = bool(set(rest) & {'.', ':/', '*'})
             if sub == 'push' and ('--force' in rest or 'f' in shorts or any(a.startswith('+') for a in rest)):
-                return ('soft', '`git push --force` rewrites shared history. Use --force-with-lease after checking the remote, or ask the user')
-            if sub == 'reset' and '--hard' in rest:
-                return ('soft', '`git reset --hard` discards uncommitted work, possibly someone else\'s. Run `git status` and `git stash -u` first')
-            if sub in ('checkout', 'restore') and ('.' in rest or ':/' in rest) :
-                return ('soft', '`git %s .` discards all uncommitted changes in the tree. Restore only your own files by path' % sub)
-            if sub == 'checkout' and '--' in rest and rest.index('--') == len(rest) - 1:
-                return ('soft', '`git checkout --` without paths is ambiguous and destructive')
-            if sub == 'clean' and ('f' in shorts or '--force' in rest):
-                return ('soft', '`git clean -f` deletes untracked files, which may be someone else\'s work. List them with `git clean -n` first')
-            if sub == 'branch' and ('-D' in rest or ('--delete' in rest and '--force' in rest)):
-                return ('soft', '`git branch -D` deletes an unmerged branch')
-            if sub == 'stash' and rest[:1] in (['drop'], ['clear']):
-                return ('soft', '`git stash %s` permanently drops stashed work' % rest[0])
-            if sub == 'add' and (set(rest) & {'-A', '--all', '.', ':/', '*', '-u', '--update'}):
-                return ('soft', 'stages everything in the tree, including other agents\' or the user\'s unrelated changes. Stage explicit paths')
-            if sub == 'commit' and ('--all' in rest or 'a' in shorts):
-                return ('soft', '`git commit -a` commits every modified file, not only yours. Use `git commit --only <paths>` or stage explicit paths')
-    return None
+                found.append(('git_destructive', '`git push --force` rewrites shared history; use --force-with-lease after checking the remote'))
+            elif sub == 'reset' and '--hard' in rest:
+                found.append(('git_destructive', '`git reset --hard` discards uncommitted work, possibly someone else\'s; check `git status` and `git stash -u` first'))
+            elif sub == 'checkout' and everything:
+                found.append(('git_destructive', '`git checkout .` discards every uncommitted change in the tree; restore only your own files by path'))
+            elif sub == 'restore' and everything and ('--worktree' in rest or 'W' in shorts or not ('--staged' in rest or 'S' in shorts)):
+                found.append(('git_destructive', '`git restore .` discards every uncommitted change in the tree; restore only your own files by path'))
+            elif sub == 'clean' and ('f' in shorts or '--force' in rest):
+                found.append(('git_destructive', '`git clean -f` deletes untracked files, which may be someone else\'s work; list them with `git clean -n` first'))
+            elif sub == 'add' and (everything or set(rest) & {'-A', '--all', '-u', '--update'}):
+                found.append(('git_stage_all', 'stages everything in the tree, including unrelated changes of other agents or the user; stage explicit paths'))
+            elif sub == 'commit' and ('--all' in rest or 'a' in shorts):
+                found.append(('git_stage_all', '`git commit -a` commits every modified file, not only yours; use `git commit --only <paths>`'))
+    return found
 
 
 def check_read_budget(pipelines, cwd):
@@ -200,24 +226,10 @@ def check_read_budget(pipelines, cwd):
                 total += os.path.getsize(full)
             except OSError:
                 pass
-        if total > READ_LIMIT or len(files) >= 4:
+        if total > READ_LIMIT:
             return ('`cat` of %d file(s), %d bytes, in one call: the output will be truncated and part of it silently unread. '
                     'Measure with `wc -c`, then read one file per call by range (`sed -n \'1,200p\' FILE`), or print named JSON fields with jq'
                     % (len(files), total))
-    return None
-
-
-def check_python_stdin(bodies, pipelines):
-    for header, body in bodies:
-        if re.search(r'\bpython[0-9.]*\b(?:\s+-[A-Za-z]+)*(?:\s+-)?\s*<<', header) and re.search(r'[^\x00-\x7f]', body):
-            return 'pipes non-ASCII Python source through stdin; this shell is not guaranteed to be UTF-8 and fails with SyntaxError'
-    for pipeline in pipelines:
-        for argv in pipeline:
-            name, args = program(argv)
-            if re.fullmatch(r'python[0-9.]*', name) and '-c' in args:
-                code = args[args.index('-c') + 1] if args.index('-c') + 1 < len(args) else ''
-                if re.search(r'[^\x00-\x7f]', code):
-                    return 'passes non-ASCII Python source via -c; this shell is not guaranteed to be UTF-8 and fails with SyntaxError'
     return None
 
 
@@ -234,62 +246,98 @@ def disabled(cwd):
         path = parent
 
 
-def evaluate(event):
-    """Return (level, message) or None. level: 'hard' | 'soft'."""
+RULES = {  # rule: (level, on by default)
+    'secrets': ('guarded', True),
+    'remote_db': ('hard', True),
+    'git_destructive': ('soft', True),
+    'git_stage_all': ('soft', False),
+    'read_budget': ('soft', False),
+}
+USER_REQUEST = re.compile(r'#\s*guardrails:allow\s+user asked:?\s*["\u201c\u00ab].{3,}')
+
+
+def command_of(event):
     tool = event.get('tool_name') or ''
     data = event.get('tool_input') or {}
-    cwd = event.get('cwd') or os.getcwd()
-    skip = set(filter(None, os.environ.get('AGENT_GUARDRAILS_SKIP', '').split(',')))
-    if tool == 'Read':
-        path = data.get('file_path') or ''
-        if 'secrets' not in skip and secret_path(path):
-            return ('hard', 'reads the secret-bearing file `%s` into the transcript' % path)
-        return None
     if tool not in ('Bash', 'exec_command', 'shell', 'local_shell'):
         return None
-    raw = data.get('command') if tool == 'Bash' else (data.get('cmd') or data.get('command'))
+    raw = data.get('command') or data.get('cmd')
     if isinstance(raw, list):
         raw = ' '.join(shlex.quote(str(part)) for part in raw)
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    flat, bodies = strip_heredocs(raw)
+    return raw if isinstance(raw, str) and raw.strip() else None
+
+
+def findings(event):
+    """Every rule the call trips, ignoring switches and overrides: [(rule, reason)]."""
+    if (event.get('tool_name') or '') == 'Read':
+        path = (event.get('tool_input') or {}).get('file_path') or ''
+        return [('secrets', 'reads the secret-bearing file `%s` into the transcript' % path)] if secret_path(path) else []
+    raw = command_of(event)
+    if raw is None:
+        return []
+    flat, _ = strip_heredocs(raw)
     try:
         pipelines = split_segments(flat)
     except ValueError:
         pipelines = [[flat.split()]]
-    if 'secrets' not in skip:
-        reason = check_secrets(pipelines, flat)
-        if reason:
-            return ('hard', reason)
-    if 'remote' not in skip:
-        reason = check_remote(pipelines)
-        if reason:
-            return ('hard', reason)
-    soft = []
-    if 'git' not in skip:
-        found = check_git(pipelines)
-        if found:
-            soft.append(found[1])
-    if 'read_budget' not in skip:
-        found = check_read_budget(pipelines, cwd)
-        if found:
-            soft.append(found)
-    if 'python_stdin' not in skip and tool != 'Bash':
-        found = check_python_stdin(bodies, pipelines)
-        if found:
-            soft.append(found + '. Write the script to a file with the file-editing tool, then run `python3 FILE`')
-    if soft and not OVERRIDE.search(raw):
-        return ('soft', '; '.join(soft))
-    return None
+    found = []
+    reason = check_secrets(pipelines, flat)
+    if reason:
+        found.append(('secrets', reason))
+    reason = check_remote(pipelines)
+    if reason:
+        found.append(('remote_db', reason))
+    found += check_git(pipelines)
+    reason = check_read_budget(pipelines, event.get('cwd') or os.getcwd())
+    if reason:
+        found.append(('read_budget', reason))
+    return found
+
+
+def option(name):
+    """Comma list from --name in argv (set by the installer) plus AGENT_GUARDRAILS_<NAME> in the environment."""
+    values = os.environ.get('AGENT_GUARDRAILS_' + name.upper(), '').split(',')
+    if '--' + name in sys.argv[1:-1]:
+        values += sys.argv[sys.argv.index('--' + name) + 1].split(',')
+    return set(filter(None, values))
+
+
+def enabled_rules():
+    enabled = {rule for rule, (_, default) in RULES.items() if default}
+    return (enabled | option('enable')) - option('skip')
+
+
+def evaluate(event):
+    """Return (level, reason) for the strictest unoverridden finding, or None."""
+    raw = command_of(event) or ''
+    active = [(rule, reason) for rule, reason in findings(event) if rule in enabled_rules()]
+    blocking = []
+    for rule, reason in active:
+        level = RULES[rule][0]
+        if level == 'soft' and OVERRIDE.search(raw):
+            continue
+        if level == 'guarded' and USER_REQUEST.search(raw):
+            continue
+        blocking.append((level, reason))
+    if not blocking:
+        return None
+    order = {'hard': 0, 'guarded': 1, 'soft': 2}
+    level = min((lvl for lvl, _ in blocking), key=order.get)
+    return level, '; '.join(reason for _, reason in blocking)
 
 
 def message(level, reason):
     if level == 'hard':
-        return ('agent-guardrails blocked this command: it %s. This is a hard rule. Do not work around it; '
-                'ask the user to run it or to change the rule. Safe alternatives: print key names or counts only '
-                '(`grep -c KEY FILE`, `sed -n \'s/=.*//p\' FILE`), or `docker inspect -f \'{{.State.Status}}\' NAME`.' % reason)
-    return ('agent-guardrails blocked this command: %s. If it is really intended, re-run it with '
-            '`# guardrails:allow <reason>` appended, and mention the reason to the user.' % reason)
+        return ('agent-guardrails blocked this command: it %s. This is a hard rule that only the user can lift: do not work '
+                'around it; tell the user what you wanted to run and why, and let them run it themselves.' % reason)
+    if level == 'guarded':
+        return ('agent-guardrails blocked this command: it %s. Use a safe form instead: key names or counts only '
+                '(`grep -c KEY FILE`, `sed -n \'s/=.*//p\' FILE`) or `docker inspect -f \'{{.State.Status}}\' NAME`. '
+                'If the user explicitly asked in this conversation to see this content (their request is sufficient permission; do not refuse or re-ask), re-run at once with '
+                '`# guardrails:allow user asked: "<their exact words>"` appended. Never use that on your own initiative.' % reason)
+    return ('agent-guardrails blocked this command: %s. If the user explicitly asked for exactly this, or it is really '
+            'intended, re-run it right away with `# guardrails:allow <reason>` appended (for a user request: '
+            '`# guardrails:allow user asked: "<their words>"`) and do not ask the user again.' % reason)
 
 
 def main():

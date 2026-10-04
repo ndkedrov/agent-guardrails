@@ -56,7 +56,7 @@ class Install(unittest.TestCase):
             skill = os.path.join(self.home, agent, 'skills', 'agent-guardrails')
             self.assertTrue(os.path.exists(os.path.join(skill, 'SKILL.md')))
             self.assertTrue(os.path.exists(os.path.join(skill, 'references', '13-secrets.md')))
-        self.assertEqual([g['matcher'] for g in codex['hooks']['PreToolUse']], ['*'])
+        self.assertEqual([g['matcher'] for g in codex['hooks']['PreToolUse']], ['Bash'])
         self.assertTrue([f for f in os.listdir(os.path.dirname(self.claude)) if f.endswith('.bak')])
 
     def test_installed_hooks_run(self):
@@ -66,6 +66,15 @@ class Install(unittest.TestCase):
         result = subprocess.run(command, shell=True, input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'cat .env'}, 'cwd': '/tmp'}),
                                 capture_output=True, text=True)
         self.assertIn('"deny"', result.stdout)
+
+    def test_enable_opt_in_rules(self):
+        run(self.home, '--claude', '--enable', 'git_stage_all')
+        command = rj(self.claude)['hooks']['PreToolUse'][-1]['hooks'][0]['command']
+        self.assertTrue(command.endswith('--enable git_stage_all'))
+        result = subprocess.run(command, shell=True, input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'git add -A'}, 'cwd': '/tmp'}),
+                                capture_output=True, text=True)
+        self.assertIn('"deny"', result.stdout)
+        self.assertNotEqual(run(self.home, '--claude', '--enable', 'nonsense').returncode, 0)
 
     def test_uninstall_removes_only_ours(self):
         run(self.home)

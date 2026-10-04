@@ -7,6 +7,7 @@
   python3 install.py --no-hooks      # skill only, no hooks
   python3 install.py --uninstall     # remove the skill and only this project's hook entries
   python3 install.py --dry-run       # show what would change
+  python3 install.py --enable git_stage_all,read_budget   # also turn on opt-in guard rules
 
 Only entries whose command points at agent-guardrails/hooks/ are ever added or removed; other hooks are kept.
 Each modified settings file is backed up next to itself first.
@@ -24,13 +25,14 @@ MARK = NAME + '/hooks/'
 START_MATCHER = 'startup|resume|clear|compact'
 
 
-def hook_entries(skill_dir, agent):
+def hook_entries(skill_dir, agent, enable):
     python = sys.executable or 'python3'
+    extra = ' --enable %s' % ','.join(enable) if enable else ''
     start = {'type': 'command', 'command': '"%s" "%s"' % (python, os.path.join(skill_dir, 'hooks', 'session_start.py')), 'timeout': 10}
-    guard = {'type': 'command', 'command': '"%s" "%s"' % (python, os.path.join(skill_dir, 'hooks', 'guard.py')), 'timeout': 10}
+    guard = {'type': 'command', 'command': '"%s" "%s"%s' % (python, os.path.join(skill_dir, 'hooks', 'guard.py'), extra), 'timeout': 10}
     if agent == 'codex':
         start['additionalContextLimit'] = 3000
-        return {'SessionStart': {'matcher': START_MATCHER, 'hooks': [start]}, 'PreToolUse': {'matcher': '*', 'hooks': [guard]}}
+        return {'SessionStart': {'matcher': START_MATCHER, 'hooks': [start]}, 'PreToolUse': {'matcher': 'Bash', 'hooks': [guard]}}
     return {'SessionStart': {'matcher': START_MATCHER, 'hooks': [start]}, 'PreToolUse': {'matcher': 'Bash|Read', 'hooks': [guard]}}
 
 
@@ -107,7 +109,7 @@ def configure(agent, home, args):
         os.makedirs(os.path.dirname(skill_dir), exist_ok=True)
         install_skill(skill_dir, args.dry_run)
         if not args.no_hooks:
-            for event, group in hook_entries(skill_dir, agent).items():
+            for event, group in hook_entries(skill_dir, agent, args.enable).items():
                 hooks.setdefault(event, []).append(group)
     if hooks:
         data['hooks'] = hooks
@@ -126,8 +128,13 @@ def main():
     parser.add_argument('--no-hooks', action='store_true')
     parser.add_argument('--uninstall', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--enable', default='', help='comma list of opt-in guard rules: git_stage_all, read_budget')
     parser.add_argument('--home', default=os.path.expanduser('~'), help=argparse.SUPPRESS)
     args = parser.parse_args()
+    args.enable = [r for r in args.enable.split(',') if r]
+    unknown = set(args.enable) - {'git_stage_all', 'read_budget'}
+    if unknown:
+        sys.exit('unknown opt-in rule(s): %s' % ', '.join(sorted(unknown)))
     agents = [a for a in ('claude', 'codex') if getattr(args, a)]
     if not agents:
         agents = [a for a in ('claude', 'codex') if os.path.isdir(os.path.join(args.home, '.' + a))]

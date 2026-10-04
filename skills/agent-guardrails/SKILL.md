@@ -9,6 +9,14 @@ Distilled from 1,156 real incidents logged by coding agents (Codex and Claude Co
 
 Use this file as a working checklist, not as reading material. When a category becomes relevant, open its reference file for the subtypes, root causes and ready-to-paste project rules.
 
+## The user's explicit request wins
+
+These rules govern what you do **on your own initiative**. An explicit request from the user in the current conversation *is* the owner's permission: if they ask for something a rule discourages, do it. Examples: "show me the whole file", "print the .env", "commit everything", "force-push it". Do not argue and do not ask again; at most mention the risk in one short line.
+
+- If the guard hook blocks a command the user explicitly asked for, re-run it immediately with `# guardrails:allow user asked: "<the user's words>"` appended. Quote what they actually said.
+- Never add that marker on your own initiative, and never paraphrase a vague request into an explicit one. "Check the DB config" is not "print the passwords".
+- The only exceptions are the hard blocks: destructive database commands and test suites on remote hosts. Show the user the exact command and let them run it themselves.
+
 ## Before the first action of a session (and after every context reset)
 
 1. **Inventory before reading.** Run `git ls-files` / `rg --files` (scoped, piped to `head`) and take every path from that output or from the task text. Never from memory.
@@ -44,7 +52,7 @@ Use this file as a working checklist, not as reading material. When a category b
 ### 04 · Use tools by their actual interface (11.8%)
 - Before the first call of an unfamiliar CLI or subcommand, read `--help` or its parser. Never invent flags, subcommands or argument order.
 - Quote globs (`rg -g '*.swift'`, `'**/*.kt'`). Unquoted globs fail in zsh when nothing matches.
-- Do not pipe non-ASCII source code (e.g. Cyrillic) into `python3 -` / `python3 -c`. Some agent shells are not UTF-8. Write the script with the file tool, then run it.
+- If a heredoc or `python3 -c` script fails with an encoding or `SyntaxError`, do not retry it the same way. Write the script to a file with the file tool, then run it.
 - One file, one patch operation. Never Delete+Add or Add+Update the same path in one `apply_patch`.
 - Check the environment before running suites: interpreter version, required packages, executable bits, active env vars. Use the project's test runner script if one exists.
 - UI drivers: take a fresh snapshot after every screen or keyboard change, and never reuse element references from an old snapshot.
@@ -110,7 +118,7 @@ Use this file as a working checklist, not as reading material. When a category b
 - Details: [references/12-requirement-gaps.md](references/12-requirement-gaps.md)
 
 ### 13 · Secrets never reach the output (1.1%)
-- Never `cat` / `grep` / print `.env*`, signing configs, `docker compose config`, `docker inspect`, process argument lists, credential files or server log heads. Filter **before** output: pick named keys or counts (`jq '{build,version}'`, `grep -c`).
+- Unless the user explicitly asked for it (see "The user's explicit request wins"), never `cat` / `grep` / print `.env*`, signing configs, `docker compose config`, `docker inspect`, process argument lists, credential files or server log heads. Filter **before** output: pick named keys or counts (`jq '{build,version}'`, `grep -c`).
 - Use an allowlist of fields to show, not a denylist of fields to hide.
 - If a secret did reach the output, say so immediately and recommend rotating it. Do not repeat the value.
 - Details: [references/13-secrets.md](references/13-secrets.md)
@@ -129,8 +137,13 @@ Use this file as a working checklist, not as reading material. When a category b
 The installer can register two hooks for Claude Code and Codex:
 
 - `hooks/session_start.py` injects a short digest of these rules at session start, resume and compaction.
-- `hooks/guard.py` (PreToolUse) blocks shell commands that print secret files, run destructive database commands over SSH, discard work with destructive git commands, stage everything blindly, or dump several files in one read.
-  - Soft blocks can be overridden deliberately by appending `# guardrails:allow <reason>` to the command.
-  - Hard blocks (secrets, destructive database commands over SSH) require the user to act.
+- `hooks/guard.py` (PreToolUse) blocks three things by default:
+  - printing secret values (`cat .env`, `grep TOKEN .env`, private keys, `docker inspect`, bare `env`);
+  - destructive database commands and test suites over `ssh` / `kubectl exec`;
+  - work-discarding git commands (`reset --hard`, `checkout .`, `clean -f`, `push --force`).
+
+  Two more checks are opt-in: staging everything (`git add -A`, `commit -a`) and reading large files with `cat`.
+
+  When a soft block fires, follow its message. Re-run with `# guardrails:allow <reason>` only when the action is really intended, or with `# guardrails:allow user asked: "<words>"` when the user explicitly requested it. Secret reads accept only the user-request form. Remote destructive commands cannot be overridden by you.
 
 Rules in text get forgotten. Hooks do not. When a mistake repeats, prefer a hook or a wrapper script over another sentence of instructions.
